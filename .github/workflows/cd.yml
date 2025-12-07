@@ -1,0 +1,74 @@
+name: CD (compose over SSH)
+
+on:
+  release:
+    types: [published]
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # SSH-ключ лежит в secrets.SSH_PRIVATE_KEY (НЕ base64)
+      - name: Start ssh-agent and add key
+        uses: webfactory/ssh-agent@v0.7.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Set variables
+        run: |
+          OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "OWNER_LOWER=${OWNER_LOWER}" >> $GITHUB_ENV
+          echo "IMAGE_NAME=ghcr.io/${OWNER_LOWER}/catty-reminders-app:latest" >> $GITHUB_ENV
+          echo "APP_DIR=/home/vboxuser/apps/catty-reminders-app" >> $GITHUB_ENV
+
+      # Кладём compose, .env и config.json на сервер
+      - name: Ensure remote dir and copy compose/.env/config
+        env:
+          SERVER_USER: vboxuser
+          SERVER_HOST: course.prafdin.ru
+          SERVER_PORT: 2454
+        run: |
+          ssh -o StrictHostKeyChecking=no -p "$SERVER_PORT" "$SERVER_USER@$SERVER_HOST" "mkdir -p '$APP_DIR'"
+
+          scp -P "$SERVER_PORT" docker-compose.yml "$SERVER_USER@$SERVER_HOST:$APP_DIR/docker-compose.yml"
+          scp -P "$SERVER_PORT" .env "$SERVER_USER@$SERVER_HOST:$APP_DIR/.env"
+          scp -P "$SERVER_PORT" config.json "$SERVER_USER@$SERVER_HOST:$APP_DIR/config.json"
+
+      - name: Deploy with Docker Compose on server
+        env:
+          SERVER_USER: vboxuser
+          SERVER_HOST: course.prafdin.ru
+          SERVER_PORT: 2454
+          GHCR_USER: sanechek600
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          ssh -o StrictHostKeyChecking=no -p "$SERVER_PORT" "$SERVER_USER@$SERVER_HOST" "
+            set -euxo pipefail
+
+            cd '$APP_DIR'
+
+            # логин в GHCR
+            echo \"$GHCR_TOKEN\" | docker login ghcr.io -u \"$GHCR_USER\" --password-stdin
+
+            echo '🧹 Останавливаем docker compose (если запущен)'
+            docker compose down  true
+
+            echo '⬇️ Тянем свежие образы'
+            docker compose pull
+
+            echo '🚀 Поднимаем стек'
+            docker compose up -d --remove-orphans
+
+            echo '📦 Текущее состояние сервисов:'
+            docker compose ps
+
+            echo '🩺 Проверяем HTTP на 8181'
+            sleep 2
+            curl -sI http://127.0.0.1:8181/  true
+          "
