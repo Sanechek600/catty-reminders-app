@@ -1,0 +1,70 @@
+name: CD Deploy
+
+on: 
+  release: 
+    types: [published] 
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check SSH_PRIVATE_KEY_B64
+        run: |
+          if [ -z "${{ secrets.SSH_PRIVATE_KEY_B64 }}" ]; then
+            echo "❌ SSH_PRIVATE_KEY_B64 is empty or not visible to this job"; exit 1;
+          fi
+          echo "✅ SSH_PRIVATE_KEY_B64 length: $(echo '${{ secrets.SSH_PRIVATE_KEY_B64 }}' | wc -c) bytes"
+
+      - name: Decode SSH key and test connection
+        shell: bash
+        run: |
+          echo "${{ secrets.SSH_PRIVATE_KEY_B64 }}" | base64 -d > key.pem
+          chmod 600 key.pem
+          echo "🔑 Testing SSH connection..."
+          ssh -i key.pem -p 2454 -o StrictHostKeyChecking=no vboxuser@course.prafdin.ru 'echo "✅ SSH connection OK"'
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: course.prafdin.ru
+          username: vboxuser
+          port: 2454
+          key_path: key.pem
+          script_stop: true
+          timeout: 60s
+          command_timeout: 10m
+          debug: true
+          script: |
+            set -euxo pipefail
+
+            # всегда lowercase для пути образа на GHCR
+            OWNER_LC="$(echo 'sanechek600' | tr '[:upper:]' '[:lower:]')"
+            IMAGE="ghcr.io/${OWNER_LC}/catty-reminders-app:latest"
+
+            echo "🔐 Logging in to GHCR..."
+            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${OWNER_LC}" --password-stdin
+            echo "✅ GHCR login ok"
+
+            echo "🧹 Removing containers that use port 8181 (if any)..."
+            docker ps --format '{{.ID}} {{.Ports}}' \
+              | awk '$0 ~ /:8181->/ {print $1}' \
+              | xargs -r docker rm -f
+
+            echo "⬇️ Pulling latest Docker image..."
+            docker pull "${IMAGE}"
+
+            echo "🔎 Pulled images (with digests):"
+            docker image ls "${IMAGE%:*}" --digests
+
+            echo "🚀 Starting new container..."
+            docker run -d --name catty-reminders -p 8181:8181 --restart=always "${IMAGE}"
+
+            echo "🩺 Checking container health..."
+            sleep 3
+            curl -sI http://127.0.0.1:8181/ || true
+
+            echo "📦 Running containers:"
+            docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}'
+
+            echo "✅ Deployment complete!"
